@@ -1,0 +1,103 @@
+# This starter workflow is for a CMake project running on a single platform. There is a different starter workflow if you need cross-platform coverage.
+# See: https://github.com/actions/starter-workflows/blob/main/ci/cmake-multi-platform.yml
+name: CMake on a single platform
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  release:
+    types: [ "published" ]
+
+env:
+  # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)
+  BUILD_TYPE: Release
+  XWIN_CACHE_PATH: .xwc
+  SPLAT_PATH: splat
+
+jobs:
+  build:
+    # The CMake configure and build commands are platform agnostic and should work equally well on Windows or Mac.
+    # You can convert this to a matrix build if you need cross-platform coverage.
+    # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Install Dependencies
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo mkdir -pm755 /etc/apt/keyrings
+        wget -O - https://dl.winehq.org/wine-builds/winehq.key | sudo gpg --dearmor -o /etc/apt/keyrings/winehq-archive.key -
+        sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/noble/winehq-noble.sources
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 22
+        sudo apt update
+        sudo apt install -y libasound2-dev libsystemd-dev wine-devel wine-devel-dev clang-22 lld-22
+        echo "/usr/lib/llvm-22/bin" >> $GITHUB_PATH
+        echo "/opt/wine-devel/bin" >> $GITHUB_PATH
+        sudo mkdir -p /usr/lib/wine/x86_64-windows
+        sudo ln -sf /opt/wine-devel/lib/wine/x86_64-windows/libwinecrt0.a /usr/lib/wine/x86_64-windows/libwinecrt0.a
+
+    - uses: actions/checkout@v7
+
+    - name: Configure xwin
+      run: curl -L -o xwin.tar.gz https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz
+
+    - name: Untar xwin
+      run: tar --strip-components=1 --wildcards -zxvf xwin.tar.gz */xwin
+
+    - name: Cache xwin
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.XWIN_CACHE_PATH }}
+        key: xwc
+
+    - name: Splat Windows SDK
+      run: ./xwin --arch x86_64 --accept-license --cache-dir ./${{ env.XWIN_CACHE_PATH }} splat --include-debug-libs --preserve-ms-arch-notation --output ./${{ env.SPLAT_PATH }}
+
+    - name: Setup cmake
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '4.4.x'
+
+    - name: Configure CMake
+      # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
+      # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
+      run: cmake -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DXWIN_SPLAT_PATH=$PWD/${{ env.SPLAT_PATH }}
+
+    - name: Build
+      # Build your program with the given configuration
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+
+    - name: Stage release
+      run: cmake --install ${{github.workspace}}/build --prefix "$PWD/dist"
+
+    - name: Create tarball
+      run: tar -C dist -czf WineDirectALSA.tar.gz .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: dist
+        path: WineDirectALSA.tar.gz
+
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Package artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: WineDirectALSA.tar.gz
