@@ -3,6 +3,8 @@ module;
 #include <vector>
 #include <cstring>
 #include <format>
+#include <chrono>
+#include <thread>
 
 #include <alsa/asoundlib.h>
 
@@ -10,13 +12,35 @@ module;
 
 module alsa_control;
 
+namespace {
+    int open_pcm_with_retry(snd_pcm_t **pcm, const char *device_name, const snd_pcm_stream_t stream) {
+        constexpr auto retry_interval = std::chrono::milliseconds(5);
+        constexpr auto retry_timeout = std::chrono::milliseconds(500);
+        const auto deadline = std::chrono::steady_clock::now() + retry_timeout;
+
+        int err;
+
+        do {
+            err = snd_pcm_open(pcm, device_name, stream, 0);
+
+            if (err != -EBUSY) {
+                return err;
+            }
+
+            std::this_thread::sleep_for(retry_interval);
+        } while (std::chrono::steady_clock::now() < deadline);
+
+        return err;
+    }
+}
+
 alsa_control::alsa_control(const char *playback_device_name, const char *capture_device_name) : playback_pcm(nullptr), capture_pcm(nullptr),
                                                                                                 playback_initialized(false),
                                                                                                 capture_initialized(false),
                                                                                                 linked(false),
                                                                                                 capture_enabled(false) {
-    snd_pcm_t *playback_pcm;
-    int err = snd_pcm_open(&playback_pcm, playback_device_name, SND_PCM_STREAM_PLAYBACK, 0);
+    snd_pcm_t *playback_pcm = nullptr;
+    int err = open_pcm_with_retry(&playback_pcm, playback_device_name, SND_PCM_STREAM_PLAYBACK);
 
     if (err < 0) {
         // Failed
@@ -27,8 +51,8 @@ alsa_control::alsa_control(const char *playback_device_name, const char *capture
     playback_initialized = true;
 
     if (strcmp(capture_device_name, "(None)") != 0) {
-        snd_pcm_t *capture_pcm;
-        err = snd_pcm_open(&capture_pcm, capture_device_name, SND_PCM_STREAM_CAPTURE, 0);
+        snd_pcm_t *capture_pcm = nullptr;
+        err = open_pcm_with_retry(&capture_pcm, capture_device_name, SND_PCM_STREAM_CAPTURE);
 
         if (err < 0) {
             // Failed
@@ -41,9 +65,8 @@ alsa_control::alsa_control(const char *playback_device_name, const char *capture
 }
 
 alsa_control::~alsa_control() {
-    stop();
-
     if (playback_initialized) {
+        stop();
         snd_pcm_close(playback_pcm);
 
         playback_initialized = false;
@@ -204,14 +227,20 @@ bool alsa_control::is_capture_initialized() const {
 }
 
 bool alsa_control::set_buffer(const int sample_rate, const int period_size, const int buffer_size, const bool enable_capture) {
-    if (!playback_initialized) {
+    if (!playback_initialized || sample_rate <= 0 || period_size <= 0 || buffer_size <= 0) {
         return false;
     }
+
+    const auto requested_rate = static_cast<unsigned int>(sample_rate);
+    const auto requested_period = static_cast<snd_pcm_uframes_t>(period_size);
+    const auto requested_buffer = static_cast<snd_pcm_uframes_t>(buffer_size);
 
     capture_enabled = enable_capture && capture_initialized;
 
     if (linked) {
-        snd_pcm_unlink(playback_pcm);
+        if (snd_pcm_unlink(playback_pcm) < 0) {
+            return false;
+        }
 
         linked = false;
     }
@@ -220,27 +249,15 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
         snd_pcm_hw_params_t *playback_params;
 
         snd_pcm_hw_params_alloca(&playback_params);
-        snd_pcm_hw_params_any(playback_pcm, playback_params);
-        snd_pcm_hw_params_set_access(playback_pcm, playback_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-        snd_pcm_hw_params_set_format(playback_pcm, playback_params, SND_PCM_FORMAT_S32_LE);
-        snd_pcm_hw_params_set_channels(playback_pcm, playback_params, 2);
-        snd_pcm_hw_params_set_rate(playback_pcm, playback_params, sample_rate, 0);
 
-        int err = snd_pcm_hw_params_set_period_size(playback_pcm, playback_params, period_size, 0);
-
-        if (err < 0) {
-            return false;
-        }
-
-        err = snd_pcm_hw_params_set_buffer_size(playback_pcm, playback_params, buffer_size);
-
-        if (err < 0) {
-            return false;
-        }
-
-        err = snd_pcm_hw_params(playback_pcm, playback_params);
-
-        if (err < 0) {
+        if (snd_pcm_hw_params_any(playback_pcm, playback_params) < 0 ||
+            snd_pcm_hw_params_set_access(playback_pcm, playback_params, SND_PCM_ACCESS_RW_INTERLEAVED) < 0 ||
+            snd_pcm_hw_params_set_format(playback_pcm, playback_params, SND_PCM_FORMAT_S32_LE) < 0 ||
+            snd_pcm_hw_params_set_channels(playback_pcm, playback_params, 2) < 0 ||
+            snd_pcm_hw_params_set_rate(playback_pcm, playback_params, requested_rate, 0) < 0 ||
+            snd_pcm_hw_params_set_period_size(playback_pcm, playback_params, requested_period, 0) < 0 ||
+            snd_pcm_hw_params_set_buffer_size(playback_pcm, playback_params, requested_buffer) < 0 ||
+            snd_pcm_hw_params(playback_pcm, playback_params) < 0) {
             return false;
         }
 
@@ -249,11 +266,13 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
         unsigned int playback_actual_rate = 0;
         int playback_dir = 0;
 
-        snd_pcm_hw_params_get_period_size(playback_params, &playback_actual_period, &playback_dir);
-        snd_pcm_hw_params_get_buffer_size(playback_params, &playback_actual_buffer);
-        snd_pcm_hw_params_get_rate(playback_params, &playback_actual_rate, &playback_dir);
+        if (snd_pcm_hw_params_get_period_size(playback_params, &playback_actual_period, &playback_dir) < 0 ||
+            snd_pcm_hw_params_get_buffer_size(playback_params, &playback_actual_buffer) < 0 ||
+            snd_pcm_hw_params_get_rate(playback_params, &playback_actual_rate, &playback_dir) < 0) {
+            return false;
+        }
 
-        if (playback_actual_period != period_size || playback_actual_buffer != buffer_size || playback_actual_rate != sample_rate) {
+        if (playback_actual_period != requested_period || playback_actual_buffer != requested_buffer || playback_actual_rate != requested_rate) {
             return false;
         }
 
@@ -265,7 +284,7 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
             return false;
         }
 
-        if (snd_pcm_sw_params_set_avail_min(playback_pcm, sw, period_size) < 0) {
+        if (snd_pcm_sw_params_set_avail_min(playback_pcm, sw, requested_period) < 0) {
             return false;
         }
 
@@ -275,7 +294,7 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
             return false;
         }
 
-        if (snd_pcm_sw_params_set_start_threshold(playback_pcm, sw, buffer_size + 1) < 0) {
+        if (snd_pcm_sw_params_set_start_threshold(playback_pcm, sw, requested_buffer + 1) < 0) {
             return false;
         }
 
@@ -288,27 +307,15 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
         snd_pcm_hw_params_t *capture_params;
 
         snd_pcm_hw_params_alloca(&capture_params);
-        snd_pcm_hw_params_any(capture_pcm, capture_params);
-        snd_pcm_hw_params_set_access(capture_pcm, capture_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-        snd_pcm_hw_params_set_format(capture_pcm, capture_params, SND_PCM_FORMAT_S32_LE);
-        snd_pcm_hw_params_set_channels(capture_pcm, capture_params, 2);
-        snd_pcm_hw_params_set_rate(capture_pcm, capture_params, sample_rate, 0);
 
-        int err = snd_pcm_hw_params_set_period_size(capture_pcm, capture_params, period_size, 0);
-
-        if (err < 0) {
-            return false;
-        }
-
-        err = snd_pcm_hw_params_set_buffer_size(capture_pcm, capture_params, buffer_size);
-
-        if (err < 0) {
-            return false;
-        }
-
-        err = snd_pcm_hw_params(capture_pcm, capture_params);
-
-        if (err < 0) {
+        if (snd_pcm_hw_params_any(capture_pcm, capture_params) < 0 ||
+            snd_pcm_hw_params_set_access(capture_pcm, capture_params, SND_PCM_ACCESS_RW_INTERLEAVED) < 0 ||
+            snd_pcm_hw_params_set_format(capture_pcm, capture_params, SND_PCM_FORMAT_S32_LE) < 0 ||
+            snd_pcm_hw_params_set_channels(capture_pcm, capture_params, 2) < 0 ||
+            snd_pcm_hw_params_set_rate(capture_pcm, capture_params, requested_rate, 0) < 0 ||
+            snd_pcm_hw_params_set_period_size(capture_pcm, capture_params, requested_period, 0) < 0 ||
+            snd_pcm_hw_params_set_buffer_size(capture_pcm, capture_params, requested_buffer) < 0 ||
+            snd_pcm_hw_params(capture_pcm, capture_params) < 0) {
             return false;
         }
 
@@ -317,11 +324,13 @@ bool alsa_control::set_buffer(const int sample_rate, const int period_size, cons
         unsigned int capture_actual_rate = 0;
         int capture_dir = 0;
 
-        snd_pcm_hw_params_get_period_size(capture_params, &capture_actual_period, &capture_dir);
-        snd_pcm_hw_params_get_buffer_size(capture_params, &capture_actual_buffer);
-        snd_pcm_hw_params_get_rate(capture_params, &capture_actual_rate, &capture_dir);
+        if (snd_pcm_hw_params_get_period_size(capture_params, &capture_actual_period, &capture_dir) < 0 ||
+            snd_pcm_hw_params_get_buffer_size(capture_params, &capture_actual_buffer) < 0 ||
+            snd_pcm_hw_params_get_rate(capture_params, &capture_actual_rate, &capture_dir) < 0) {
+            return false;
+        }
 
-        if (capture_actual_period != period_size || capture_actual_buffer != buffer_size || capture_actual_rate != sample_rate) {
+        if (capture_actual_period != requested_period || capture_actual_buffer != requested_buffer || capture_actual_rate != requested_rate) {
             return false;
         }
 
@@ -436,6 +445,10 @@ bool alsa_control::prepare() const {
 }
 
 bool alsa_control::stop() const {
+    if (!playback_initialized) {
+        return true;
+    }
+
     if (linked) {
         return snd_pcm_drop(playback_pcm) >= 0;
     }

@@ -1,6 +1,4 @@
 #include <memory>
-#include <thread>
-#include <chrono>
 
 #include <unixlib.h>
 
@@ -48,18 +46,15 @@ NTSTATUS request_rt_thread_func(void *args) {
 
 NTSTATUS init_alsa_func(void *args) {
     if (ac != nullptr && ac->is_playback_initialized()) {
-        // init may be called multiple times
-        return 0;
-    }
-
-    if (!request_acqiure()) {
         return 1;
     }
 
-    // Grant sufficient time to take ownership of the device
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
     const auto data = static_cast<init_data*>(args);
+
+    if (!request_acquire(data->output, data->input)) {
+        return 1;
+    }
+
     ac = std::make_unique<alsa_control>(data->output, data->input);
 
     if (!ac->is_playback_initialized()) {

@@ -6,6 +6,7 @@ module;
 #include <atomic>
 #include <string>
 #include <thread>
+#include <mutex>
 
 #include <unknwn.h>
 
@@ -25,12 +26,12 @@ export class CASIO final : public ASIO::IASIO {
     ULONG ref_count;
     State state;
     HWND sys_handle;
+    bool backend_initialized;
     bool is_capture_available;
     bool capture_active;
     ASIO::SampleRate sample_rate;
     long buffer_size;
     ASIO::Callbacks callbacks;
-    bool callbacks_valid;
     std::array<bool, 2> input_active;
     std::array<bool, 2> output_active;
     std::array<std::array<std::vector<std::int32_t>, 2>, 2> input_buffers;
@@ -42,6 +43,7 @@ export class CASIO final : public ASIO::IASIO {
     std::vector<std::int32_t> interleaved_buffer;
     std::uint64_t stream_start_timestamp_ns = 0;
     std::vector<std::int32_t> silence_buffer;
+    std::mutex backend_state_mutex;
 
     void interleave(long index) noexcept;
 
@@ -49,7 +51,7 @@ export class CASIO final : public ASIO::IASIO {
 
     void latch_start_timestamp() noexcept;
 
-    bool recover_xrun() noexcept;
+    bool recover_xrun(std::stop_token) noexcept;
 
 public:
     CASIO();

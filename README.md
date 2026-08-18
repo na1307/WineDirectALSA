@@ -6,6 +6,8 @@ An ultra-low-latency ASIO driver for Wine/Proton that connects Windows ASIO dire
 
 ### Dependencies
 
+#### Required
+
 1. Python 3.x
 2. umu-launcher
 3. The `vdf` Python package
@@ -15,6 +17,10 @@ On Arch Linux, install them as follows. (`multilib` is required.)
 ```shell
 sudo pacman -S python python-vdf umu-launcher
 ```
+
+#### Optional
+
+1. RealtimeKit (`rtkit-daemon`) (Recommended)
 
 ### Installation steps
 
@@ -33,6 +39,46 @@ sudo pacman -S python python-vdf umu-launcher
    ```
 6. Launch the game!
 
+## Limitations
+
+WineDirectALSA accesses the selected ALSA `hw:` device directly and does not perform sample-format conversion or resampling. The device must therefore natively support stereo, 48 kHz, signed 32-bit little-endian PCM (`SND_PCM_FORMAT_S32_LE`).
+
+`S32_LE` describes the sample container format and does not necessarily mean that the device provides true 32-bit conversion resolution. Many onboard HDA devices support this format—the Realtek ALC897 used for testing does—but some low-cost USB audio devices only support 16-bit or 24-bit formats.
+
+To test playback compatibility, replace `hw:0,0` with your ALSA device:
+
+```shell
+aplay \
+  --device=hw:0,0 \
+  --file-type=raw \
+  --format=S32_LE \
+  --channels=2 \
+  --rate=48000 \
+  --period-size=32 \
+  --buffer-size=128 \
+  --duration=5 \
+  --dump-hw-params \
+  /dev/zero
+```
+
+If capture is required, test the input device as well:
+
+```shell
+arecord \
+  --device=hw:0,0 \
+  --file-type=raw \
+  --format=S32_LE \
+  --channels=2 \
+  --rate=48000 \
+  --period-size=32 \
+  --buffer-size=128 \
+  --duration=5 \
+  --dump-hw-params \
+  /dev/null
+```
+
+If both commands are completed without errors, the device supports the key hardware requirements of WineDirectALSA.
+
 ## Benchmark
 
 Test system: 48 kHz, 64-frame ASIO buffer, RTL Utility 0.5.2, Realtek ALC897
@@ -50,6 +96,8 @@ Test system: 48 kHz, 64-frame ASIO buffer, RTL Utility 0.5.2, Realtek ALC897
 ## Building
 
 ### Dependencies
+
+#### Required
 
 1. CMake
 2. Ninja

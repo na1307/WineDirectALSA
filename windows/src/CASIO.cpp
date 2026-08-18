@@ -3,6 +3,7 @@ module;
 #include <atomic>
 #include <thread>
 #include <filesystem>
+#include <mutex>
 
 #include <windows.h>
 
@@ -18,21 +19,36 @@ constexpr int asio_buffer_size = 64;
 
 constexpr int alsa_period_size = 32;
 constexpr int alsa_buffer_size = 128;
-constexpr int alsa_buffer_periods = alsa_buffer_size / alsa_period_size;
-
-constexpr int asio_blocks_per_alsa_buffer = alsa_buffer_size / asio_buffer_size;
 
 static_assert(alsa_buffer_size % alsa_period_size == 0);
 
 static_assert(alsa_buffer_size % asio_buffer_size == 0);
 
-CASIO::CASIO() : ref_count(0), state(State::Created), sys_handle(nullptr), is_capture_available(false), capture_active(false), sample_rate(48000.0),
-                 buffer_size(asio_buffer_size), callbacks({}), callbacks_valid(false), input_active({}), output_active({}), sample_position(0) {
+CASIO::CASIO() : ref_count(0), state(State::Created), sys_handle(nullptr), backend_initialized(false), is_capture_available(false),
+                 capture_active(false), sample_rate(48000.0), buffer_size(asio_buffer_size), callbacks({}), input_active({}),
+                 output_active({}), sample_position(0) {
     global_ref_count++;
 }
 
 CASIO::~CASIO() {
-    uninit_backend();
+    if (state == State::Running) {
+        stop();
+    } else if (audio_thread.joinable()) {
+        // Defensive fallback: never release the backend while its worker
+        // thread could still be using ALSA handles or member buffers.
+        audio_thread.request_stop();
+
+        {
+            std::scoped_lock lock(backend_state_mutex);
+            stop_backend();
+        }
+
+        audio_thread.join();
+    }
+
+    if (backend_initialized) {
+        uninit_backend();
+    }
 
     global_ref_count--;
 }
@@ -68,7 +84,11 @@ void CASIO::latch_start_timestamp() noexcept {
     stream_start_timestamp_ns = static_cast<std::uint64_t>(timeGetTime()) * 1'000'000ULL;
 }
 
-bool CASIO::recover_xrun() noexcept {
+bool CASIO::recover_xrun(const std::stop_token stop) noexcept {
+    if (stop.stop_requested()) {
+        return false;
+    }
+
     // ASIO host가 overload notification을 지원하면 알림
     if (callbacks.asioMessage != nullptr) {
         const long supported = callbacks.asioMessage(ASIO::MessageSelector::SelectorSupported,
@@ -88,6 +108,10 @@ bool CASIO::recover_xrun() noexcept {
     static_assert(alsa_buffer_size % asio_buffer_size == 0);
 
     for (int i = 0; i < recovery_blocks; ++i) {
+        if (stop.stop_requested()) {
+            return false;
+        }
+
         if (write_backend(silence_buffer.data(), asio_buffer_size) != audio_result_ok) {
             return false;
         }
@@ -95,8 +119,12 @@ bool CASIO::recover_xrun() noexcept {
 
     sample_position.fetch_add(alsa_buffer_size, std::memory_order::relaxed);
 
-    if (!start_backend()) {
-        return false;
+    {
+        std::scoped_lock lock(backend_state_mutex);
+
+        if (stop.stop_requested() || !start_backend()) {
+            return false;
+        }
     }
 
     return true;
@@ -173,6 +201,7 @@ ASIO::Bool CASIO::init(void *sysHandle) {
         return ASIO::Bool::False;
     }
 
+    backend_initialized = true;
     is_capture_available = backend_capture_available();
     state = State::Initialized;
     last_error.clear();
@@ -227,11 +256,15 @@ ASIO::Error CASIO::start() {
 
         callbacks.bufferSwitch(0, ASIO::Bool::True);
 
+        if (stop.stop_requested()) {
+            return;
+        }
+
         interleave(1);
 
         auto result = write_backend(interleaved_buffer.data(), buffer_size);
 
-        if (result != audio_result_ok) {
+        if (result != audio_result_ok || stop.stop_requested()) {
             return;
         }
 
@@ -239,12 +272,16 @@ ASIO::Error CASIO::start() {
 
         result = write_backend(interleaved_buffer.data(), buffer_size);
 
-        if (result != audio_result_ok) {
+        if (result != audio_result_ok || stop.stop_requested()) {
             return;
         }
 
-        if (!start_backend()) {
-            return;
+        {
+            std::scoped_lock lock(backend_state_mutex);
+
+            if (stop.stop_requested() || !start_backend()) {
+                return;
+            }
         }
 
         latch_start_timestamp();
@@ -256,8 +293,12 @@ ASIO::Error CASIO::start() {
                           ? read_backend(capture_interleaved_buffer.data(), asio_buffer_size)
                           : wait_backend_period();
 
+            if (stop.stop_requested()) {
+                break;
+            }
+
             if (ar == audio_result_xrun) {
-                if (!recover_xrun()) {
+                if (!recover_xrun(stop)) {
                     break;
                 }
 
@@ -278,10 +319,14 @@ ASIO::Error CASIO::start() {
 
             ar = write_backend(interleaved_buffer.data(), buffer_size);
 
+            if (stop.stop_requested()) {
+                break;
+            }
+
             if (ar == audio_result_xrun) {
                 index ^= 1;
 
-                if (!recover_xrun()) {
+                if (!recover_xrun(stop)) {
                     break;
                 }
 
@@ -307,12 +352,21 @@ ASIO::Error CASIO::stop() {
     }
 
     audio_thread.request_stop();
-    audio_thread.join();
-    stop_backend();
+
+    bool stopped;
+
+    {
+        std::scoped_lock lock(backend_state_mutex);
+        stopped = stop_backend();
+    }
+
+    if (audio_thread.joinable()) {
+        audio_thread.join();
+    }
 
     state = State::Prepared;
 
-    return ASIO::Error::OK;
+    return stopped ? ASIO::Error::OK : ASIO::Error::HWMalfunction;
 }
 
 ASIO::Error CASIO::getChannels(std::int32_t *numInputChannels, std::int32_t *numOutputChannels) {
@@ -331,7 +385,7 @@ ASIO::Error CASIO::getLatencies(std::int32_t *inputLatency, std::int32_t *output
         return ASIO::Error::InvalidParameter;
     }
 
-    *inputLatency = 64;
+    *inputLatency = asio_buffer_size;
     *outputLatency = alsa_buffer_size - alsa_period_size;
 
     return ASIO::Error::OK;
@@ -351,22 +405,7 @@ ASIO::Error CASIO::getBufferSize(std::int32_t *minSize, std::int32_t *maxSize, s
 }
 
 ASIO::Error CASIO::canSampleRate(ASIO::SampleRate sampleRate) {
-    if (sampleRate != floor(sampleRate)) {
-        return ASIO::Error::NoClock;
-    }
-
-    const auto r = static_cast<unsigned>(sampleRate);
-
-    switch (r) {
-    case 44100:
-    case 48000:
-    case 96000:
-    case 192000:
-        return ASIO::Error::OK;
-
-    default:
-        return ASIO::Error::NoClock;
-    }
+    return sampleRate == 48000.0 ? ASIO::Error::OK : ASIO::Error::NoClock;
 }
 
 ASIO::Error CASIO::getSampleRate(ASIO::SampleRate *sampleRate) {
@@ -461,13 +500,13 @@ ASIO::Error CASIO::getChannelInfo(ASIO::ChannelInfo *info) {
         info->channelGroup = 1;
         info->type = ASIO::SampleType::Int32LSB;
 
-        std::snprintf(info->name, sizeof(info->name), "ALSA In %ld", info->channel + 1);
+        std::snprintf(info->name, sizeof(info->name), "ALSA In %d", info->channel + 1);
     } else {
         info->isActive = output_active[info->channel] ? ASIO::Bool::True : ASIO::Bool::False;
         info->channelGroup = 0;
         info->type = ASIO::SampleType::Int32LSB;
 
-        std::snprintf(info->name, sizeof(info->name), "ALSA Out %ld", info->channel + 1);
+        std::snprintf(info->name, sizeof(info->name), "ALSA Out %d", info->channel + 1);
     }
 
     return ASIO::Error::OK;
@@ -530,7 +569,6 @@ ASIO::Error CASIO::createBuffers(ASIO::BufferInfo *bufferInfos, std::int32_t num
     }
 
     this->callbacks = *callbacks;
-    callbacks_valid = true;
     buffer_size = bufferSize;
     capture_active = input_active[0] || input_active[1];
 
@@ -573,7 +611,6 @@ ASIO::Error CASIO::disposeBuffers() {
     input_active.fill(false);
     output_active.fill(false);
     callbacks = {};
-    callbacks_valid = false;
 
     state = State::Initialized;
 
